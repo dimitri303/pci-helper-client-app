@@ -7,69 +7,73 @@
   <!-- Genesys Client App SDK -->
   <script src="https://apps.mypurecloud.com/client-apps/sdk/purecloud-client-app-sdk.js"></script>
 
-  <!--
-    Security notes:
-    - Replace the ALLOWED_ORIGINS entry below with the exact origin(s) of your wrapper iframe.
-    - Replace BACKEND_START_URL with your backend endpoint and secure it (auth, TLS).
-    - Consider adding a Content Security Policy (CSP) header on the server, and serve this page over HTTPS.
-  -->
+  <meta http-equiv="Content-Security-Policy"
+        content="
+          default-src 'self';
+          script-src 'self' https://apps.mypurecloud.com 'unsafe-inline';
+          connect-src 'self' https://YOUR-BACKEND;
+        ">
 </head>
 
 <body>
 <script>
-  // Configuration — update these values for production
+  /**
+   * CONFIGURATION
+   * Update these for your environment
+   */
+
+  // EXACT origin of the wrapper page (no trailing slash)
   const ALLOWED_ORIGINS = [
-    'https://your-wrapper-domain' // <- replace with the exact origin of the wrapper iframe (no trailing slash)
+    'https://dimitri303.github.io'
   ];
-  const BACKEND_START_URL = 'https://YOUR-BACKEND/start-pci-session'; // <- replace with your backend URL
-  const BACKEND_TIMEOUT_MS = 10000; // fetch timeout
 
-  // Initialise the Client App
-  const clientApp = new window.purecloud.apps.ClientApp({
-    pcEnvironment: 'euwest2' // change if needed
-  });
+  // Backend endpoint that:
+  // - creates / resumes PCI Pal session
+  // - establishes secure IVR leg in Genesys
+  // - returns { sid, bt, rt }
+  const BACKEND_START_URL = 'https://YOUR-BACKEND/start-pci-session';
 
-  // Ready lifecycle
-  clientApp.lifecycle.ready.then(() => {
-    console.log('PCI Helper Client App ready');
-  }).catch(err => {
-    console.error('Client app lifecycle ready failed', err);
-  });
+  // Backend call timeout
+  const BACKEND_TIMEOUT_MS = 10000;
 
   /**
-   * Handle messages from wrapper iframe.
-   * IMPORTANT: we validate origin against ALLOWED_ORIGINS to avoid accepting forged messages.
+   * Initialise the Genesys Client App
+   */
+  const clientApp = new window.purecloud.apps.ClientApp({
+    pcEnvironment: 'euwest2' // adjust if required
+  });
+
+  clientApp.lifecycle.ready
+    .then(() => console.log('PCI Helper Client App ready'))
+    .catch(err => console.error('Client App lifecycle error', err));
+
+  /**
+   * Listen for messages from the wrapper iframe
    */
   window.addEventListener('message', async (event) => {
-    // Validate origin early
-    if (!event || !event.origin) return;
-    if (!ALLOWED_ORIGINS.includes(event.origin)) {
-      // Reject messages from unknown origins
-      console.warn('Rejected message from origin', event.origin);
+
+    // Origin validation
+    if (!event || !event.origin || !ALLOWED_ORIGINS.includes(event.origin)) {
       return;
     }
 
-    // Validate event shape
+    // Validate message
     if (!event.data || event.data.type !== 'START_PCI_PAYMENT') return;
-    if (!event.source) {
-      console.warn('Message sender has no event.source; cannot reply.');
-      return;
-    }
+    if (!event.source) return;
 
-    // Small helper to reply back to the exact origin
     const reply = (payload) => {
       try {
         event.source.postMessage(payload, event.origin);
-      } catch (postErr) {
-        console.error('Failed to postMessage back to wrapper', postErr);
+      } catch (e) {
+        console.error('postMessage failed', e);
       }
     };
 
-    // Inform wrapper we're starting (optional)
+    // Inform wrapper we're starting
     reply({ type: 'PCI_SESSION_STARTING' });
 
     try {
-      // Get current interaction
+      // Get the active interaction
       const interaction = await clientApp.interaction.getInteraction();
 
       if (!interaction || !interaction.id) {
@@ -77,37 +81,32 @@
       }
 
       const conversationId = interaction.id;
-      console.log('Starting PCI payment for conversation', conversationId);
+      console.log('Starting PCI for conversation', conversationId);
 
-      // Use AbortController to enforce a timeout
+      // Backend call with timeout
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), BACKEND_TIMEOUT_MS);
+      const timer = setTimeout(() => controller.abort(), BACKEND_TIMEOUT_MS);
 
       const response = await fetch(BACKEND_START_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ conversationId }),
-        signal: controller.signal,
-        // credentials: 'include' // uncomment only if needed and CORS is configured
+        signal: controller.signal
       });
 
-      clearTimeout(timeout);
+      clearTimeout(timer);
 
       if (!response.ok) {
-        // Attempt to extract server error details for logging
-        let errText = '';
-        try { errText = await response.text(); } catch (e) { /* ignore */ }
-        throw new Error(`Backend error starting PCI session (status ${response.status})${errText ? ': ' + errText : ''}`);
+        throw new Error('Backend failed to start PCI session');
       }
 
       const data = await response.json();
 
-      // Minimal validation of required fields
       if (!data || !data.sid || !data.bt || !data.rt) {
-        console.warn('Backend returned incomplete session data', data);
+        throw new Error('Backend returned incomplete PCI session data');
       }
 
-      // Send session details back to wrapper iframe
+      // Send session details back to wrapper
       reply({
         type: 'PCI_SESSION_READY',
         sid: data.sid,
@@ -118,13 +117,11 @@
     } catch (err) {
       console.error('PCI start failed', err);
 
-      const publicMessage = (err && err.name === 'AbortError')
-        ? 'PCI start timed out'
-        : (err && err.message) || 'PCI start failed';
-
       reply({
         type: 'PCI_SESSION_ERROR',
-        message: publicMessage
+        message: err.name === 'AbortError'
+          ? 'PCI start timed out'
+          : err.message || 'PCI start failed'
       });
     }
   });
