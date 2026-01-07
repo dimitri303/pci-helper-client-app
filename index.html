@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>PCI Helper Client App</title>
+
+  <!-- Genesys Client App SDK -->
+  <script src="https://apps.mypurecloud.com/client-apps/sdk/purecloud-client-app-sdk.js"></script>
+
+  <!--
+    Security notes:
+    - Replace the ALLOWED_ORIGINS entry below with the exact origin(s) of your wrapper iframe.
+    - Replace BACKEND_START_URL with your backend endpoint and secure it (auth, TLS).
+    - Consider adding a Content Security Policy (CSP) header on the server, and serve this page over HTTPS.
+  -->
+</head>
+
+<body>
+<script>
+  // Configuration — update these values for production
+  const ALLOWED_ORIGINS = [
+    'https://your-wrapper-domain' // <- replace with the exact origin of the wrapper iframe (no trailing slash)
+  ];
+  const BACKEND_START_URL = 'https://YOUR-BACKEND/start-pci-session'; // <- replace with your backend URL
+  const BACKEND_TIMEOUT_MS = 10000; // fetch timeout
+
+  // Initialise the Client App
+  const clientApp = new window.purecloud.apps.ClientApp({
+    pcEnvironment: 'euwest2' // change if needed
+  });
+
+  // Ready lifecycle
+  clientApp.lifecycle.ready.then(() => {
+    console.log('PCI Helper Client App ready');
+  }).catch(err => {
+    console.error('Client app lifecycle ready failed', err);
+  });
+
+  /**
+   * Handle messages from wrapper iframe.
+   * IMPORTANT: we validate origin against ALLOWED_ORIGINS to avoid accepting forged messages.
+   */
+  window.addEventListener('message', async (event) => {
+    // Validate origin early
+    if (!event || !event.origin) return;
+    if (!ALLOWED_ORIGINS.includes(event.origin)) {
+      // Reject messages from unknown origins
+      console.warn('Rejected message from origin', event.origin);
+      return;
+    }
+
+    // Validate event shape
+    if (!event.data || event.data.type !== 'START_PCI_PAYMENT') return;
+    if (!event.source) {
+      console.warn('Message sender has no event.source; cannot reply.');
+      return;
+    }
+
+    // Small helper to reply back to the exact origin
+    const reply = (payload) => {
+      try {
+        event.source.postMessage(payload, event.origin);
+      } catch (postErr) {
+        console.error('Failed to postMessage back to wrapper', postErr);
+      }
+    };
+
+    // Inform wrapper we're starting (optional)
+    reply({ type: 'PCI_SESSION_STARTING' });
+
+    try {
+      // Get current interaction
+      const interaction = await clientApp.interaction.getInteraction();
+
+      if (!interaction || !interaction.id) {
+        throw new Error('No active interaction found');
+      }
+
+      const conversationId = interaction.id;
+      console.log('Starting PCI payment for conversation', conversationId);
+
+      // Use AbortController to enforce a timeout
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), BACKEND_TIMEOUT_MS);
+
+      const response = await fetch(BACKEND_START_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversationId }),
+        signal: controller.signal,
+        // credentials: 'include' // uncomment only if needed and CORS is configured
+      });
+
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        // Attempt to extract server error details for logging
+        let errText = '';
+        try { errText = await response.text(); } catch (e) { /* ignore */ }
+        throw new Error(`Backend error starting PCI session (status ${response.status})${errText ? ': ' + errText : ''}`);
+      }
+
+      const data = await response.json();
+
+      // Minimal validation of required fields
+      if (!data || !data.sid || !data.bt || !data.rt) {
+        console.warn('Backend returned incomplete session data', data);
+      }
+
+      // Send session details back to wrapper iframe
+      reply({
+        type: 'PCI_SESSION_READY',
+        sid: data.sid,
+        bt: data.bt,
+        rt: data.rt
+      });
+
+    } catch (err) {
+      console.error('PCI start failed', err);
+
+      const publicMessage = (err && err.name === 'AbortError')
+        ? 'PCI start timed out'
+        : (err && err.message) || 'PCI start failed';
+
+      reply({
+        type: 'PCI_SESSION_ERROR',
+        message: publicMessage
+      });
+    }
+  });
+</script>
+</body>
+</html>
