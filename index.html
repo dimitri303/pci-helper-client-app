@@ -7,6 +7,13 @@
   <!-- Genesys Client App SDK -->
   <script src="https://apps.mypurecloud.com/client-apps/sdk/purecloud-client-app-sdk.js"></script>
 
+  <!--
+    NOTE:
+    - GitHub Pages is static, so CSP here is best-effort only (headers are better).
+    - Keep this app free of secrets.
+    - This version supports a "plumbing test mode" so you can prove wrapper <-> client app messaging works
+      before you build the backend.
+  -->
   <meta http-equiv="Content-Security-Policy"
         content="
           default-src 'self';
@@ -18,29 +25,26 @@
 <body>
 <script>
   /**
-   * CONFIGURATION
-   * Update these for your environment
+   * CONFIG
    */
 
-  // EXACT origin of the wrapper page (no trailing slash)
+  // Origin(s) allowed to send START_PCI_PAYMENT
+  // For GitHub Pages wrappers, this is usually just the GitHub Pages origin:
   const ALLOWED_ORIGINS = [
     'https://dimitri303.github.io'
   ];
 
-  // Backend endpoint that:
-  // - creates / resumes PCI Pal session
-  // - establishes secure IVR leg in Genesys
-  // - returns { sid, bt, rt }
-  const BACKEND_START_URL = 'https://YOUR-BACKEND/start-pci-session';
+  // Set to true to prove the message flow works without needing a backend.
+  // In this mode we return dummy sid/bt/rt values.
+  const PLUMBING_TEST_MODE = true;
 
-  // Backend call timeout
+  // Only used when PLUMBING_TEST_MODE === false
+  const BACKEND_START_URL = 'https://YOUR-BACKEND/start-pci-session';
   const BACKEND_TIMEOUT_MS = 10000;
 
-  /**
-   * Initialise the Genesys Client App
-   */
+  // Genesys region for your org (euw1 = Dublin)
   const clientApp = new window.purecloud.apps.ClientApp({
-    pcEnvironment: 'euwest2' // adjust if required
+    pcEnvironment: 'euwest1'
   });
 
   clientApp.lifecycle.ready
@@ -48,10 +52,22 @@
     .catch(err => console.error('Client App lifecycle error', err));
 
   /**
+   * Utility: safe reply back to wrapper
+   */
+  function makeReply(event) {
+    return (payload) => {
+      try {
+        event.source.postMessage(payload, event.origin);
+      } catch (e) {
+        console.error('postMessage failed', e);
+      }
+    };
+  }
+
+  /**
    * Listen for messages from the wrapper iframe
    */
   window.addEventListener('message', async (event) => {
-
     // Origin validation
     if (!event || !event.origin || !ALLOWED_ORIGINS.includes(event.origin)) {
       return;
@@ -61,29 +77,33 @@
     if (!event.data || event.data.type !== 'START_PCI_PAYMENT') return;
     if (!event.source) return;
 
-    const reply = (payload) => {
-      try {
-        event.source.postMessage(payload, event.origin);
-      } catch (e) {
-        console.error('postMessage failed', e);
-      }
-    };
+    const reply = makeReply(event);
 
-    // Inform wrapper we're starting
     reply({ type: 'PCI_SESSION_STARTING' });
 
     try {
       // Get the active interaction
       const interaction = await clientApp.interaction.getInteraction();
-
       if (!interaction || !interaction.id) {
         throw new Error('No active interaction found');
       }
 
       const conversationId = interaction.id;
-      console.log('Starting PCI for conversation', conversationId);
+      console.log('Received START_PCI_PAYMENT for conversation', conversationId);
 
-      // Backend call with timeout
+      // 1) Plumbing test mode: return dummy data so you can prove wrapper receives it
+      if (PLUMBING_TEST_MODE) {
+        console.log('PLUMBING_TEST_MODE enabled: returning dummy sid/bt/rt');
+        reply({
+          type: 'PCI_SESSION_READY',
+          sid: 'TEST_SID',
+          bt: 'TEST_BT',
+          rt: 'TEST_RT'
+        });
+        return;
+      }
+
+      // 2) Real mode: call backend to start PCI session and secure IVR leg
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), BACKEND_TIMEOUT_MS);
 
@@ -97,7 +117,12 @@
       clearTimeout(timer);
 
       if (!response.ok) {
-        throw new Error('Backend failed to start PCI session');
+        let errText = '';
+        try { errText = await response.text(); } catch (e) { /* ignore */ }
+        throw new Error(
+          `Backend failed to start PCI session (status ${response.status})` +
+          (errText ? `: ${errText}` : '')
+        );
       }
 
       const data = await response.json();
@@ -106,7 +131,6 @@
         throw new Error('Backend returned incomplete PCI session data');
       }
 
-      // Send session details back to wrapper
       reply({
         type: 'PCI_SESSION_READY',
         sid: data.sid,
@@ -119,9 +143,9 @@
 
       reply({
         type: 'PCI_SESSION_ERROR',
-        message: err.name === 'AbortError'
+        message: err && err.name === 'AbortError'
           ? 'PCI start timed out'
-          : err.message || 'PCI start failed'
+          : (err && err.message) || 'PCI start failed'
       });
     }
   });
